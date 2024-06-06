@@ -1,0 +1,21 @@
+linters:
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - revive
+    - unconvert
+    - gci
+run:
+  timeout: 5m
+linters-settings:
+  gci:
+    sections:
+      - standard
+      - default
+      - prefix(github.com/cecobask/siro-checker)
+    custom-order: true

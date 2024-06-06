@@ -7,62 +7,141 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
+
+	"github.com/PuerkitoBio/goquery"
+)
+
+const (
+	contentTypeForm   = "application/x-www-form-urlencoded"
+	envKeyEircode     = "EIRCODE"
+	urlAddressLookup  = "https://siro.ie/address-lookup-result"
+	urlSearchEircode  = "https://service.siro.ie/search-eircode"
+	urlValueCounty    = "data[county]"
+	urlValueEircode   = "data[eircode]"
+	urlValuePremiseID = "data[premiseId]"
+	urlValueQuery     = "query"
+	urlValueTown      = "data[town]"
+	urlValueValue     = "data[value]"
 )
 
 func main() {
-	r, err := search("A91C85C")
-	if err != nil {
-		fmt.Println(err)
-		if errors.Is(err, notFoundErr) {
-			return // ignore not found error
-		}
-		os.Exit(1) // alert on other errors
+	eircode, ok := os.LookupEnv(envKeyEircode)
+	if !ok {
+		panic(fmt.Sprintf("environment variable %q is not set", envKeyEircode))
 	}
-	fmt.Println(r)
+	ser, err := searchEircode(eircode)
+	if err != nil {
+		var noSuggestionsErr noSuggestionsError
+		if errors.As(err, &noSuggestionsErr) {
+			fmt.Println(noSuggestionsErr)
+			return
+		}
+		panic(err)
+	}
+	providers, err := addressLookup(ser)
+	if err != nil {
+		var notAvailableErr notAvailableError
+		if errors.As(err, &notAvailableErr) {
+			fmt.Println(notAvailableErr)
+			return
+		}
+		panic(err)
+	}
+	fmt.Println("SIRO is available via the following internet service providers:", strings.Join(providers, ", "))
 	os.Exit(1) // alert on success
 }
 
-func search(eircode string) (*response, error) {
-	parsedURL, err := url.Parse("https://service.siro.ie/search-eircode")
+func searchEircode(eircode string) (*searchEircodeResponse, error) {
+	parsedURL, err := url.Parse(urlSearchEircode)
 	if err != nil {
 		return nil, err
 	}
-	q := make(url.Values)
-	q.Set("query", eircode)
-	parsedURL.RawQuery = q.Encode()
+	query := make(url.Values)
+	query.Set(urlValueQuery, eircode)
+	parsedURL.RawQuery = query.Encode()
 	resp, err := http.Get(parsedURL.String())
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	var r *response
-	if err = json.NewDecoder(resp.Body).Decode(&r); err != nil {
+	var ser *searchEircodeResponse
+	if err = json.NewDecoder(resp.Body).Decode(&ser); err != nil {
 		return nil, err
 	}
-	if len(r.Suggestions) == 0 {
-		return nil, notFoundErr
+	if len(ser.Suggestions) == 0 {
+		return nil, noSuggestionsError{
+			eircode: eircode,
+		}
 	}
-	return r, nil
+	return ser, nil
 }
 
-var notFoundErr = errors.New("no suggestions found")
-
-type response struct {
-	Query       string       `json:"query"`
-	Suggestions []suggestion `json:"suggestions"`
-}
-
-type suggestion struct {
-	Value string `json:"value"`
-}
-
-func (r *response) String() string {
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("query: %s\n", r.Query))
-	sb.WriteString("suggestions:\n")
-	for _, s := range r.Suggestions {
-		sb.WriteString(fmt.Sprintf("  - %s\n", s.Value))
+func addressLookup(ser *searchEircodeResponse) ([]string, error) {
+	suggestion := ser.Suggestions[0]
+	form := make(url.Values)
+	form.Set(urlValueValue, suggestion.Value)
+	form.Set(urlValuePremiseID, suggestion.Data.PremiseID)
+	form.Set(urlValueCounty, suggestion.Data.County)
+	form.Set(urlValueTown, suggestion.Data.Town)
+	form.Set(urlValueEircode, suggestion.Data.Eircode)
+	resp, err := http.Post(urlAddressLookup, contentTypeForm, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
 	}
-	return sb.String()
+	defer resp.Body.Close()
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	selection := doc.Find("div .retailers_block > div")
+	if selection.Length() == 0 {
+		return nil, notAvailableError{
+			eircode: suggestion.Data.Eircode,
+		}
+	}
+	providerSet := make(map[string]struct{})
+	selection.Each(func(_ int, selection *goquery.Selection) {
+		provider, ok := selection.Attr("data-provider-name")
+		if !ok {
+			panic("could not find internet service provider attribute")
+		}
+		providerSet[provider] = struct{}{}
+	})
+	providers := make([]string, 0, len(providerSet))
+	for provider := range providerSet {
+		providers = append(providers, provider)
+	}
+	slices.Sort(providers)
+	return providers, nil
+}
+
+type noSuggestionsError struct {
+	eircode string
+}
+
+func (e noSuggestionsError) Error() string {
+	return fmt.Sprintf("no suggestions found for eircode %s", e.eircode)
+}
+
+type notAvailableError struct {
+	eircode string
+}
+
+func (e notAvailableError) Error() string {
+	return fmt.Sprintf("SIRO is not yet available at %s", e.eircode)
+}
+
+type searchEircodeResponse struct {
+	Query       string `json:"query"`
+	Suggestions []struct {
+		Value string `json:"value"`
+		Data  struct {
+			PremiseID string `json:"premiseId"`
+			County    string `json:"county"`
+			Town      string `json:"town"`
+			Eircode   string `json:"eircode"`
+		} `json:"data"`
+	} `json:"suggestions"`
 }
